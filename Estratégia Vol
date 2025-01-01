@@ -1,0 +1,345 @@
+import yfinance as yf
+import pandas as pd
+import numpy as np
+from arch import arch_model
+from flask import Flask
+
+###############################################################################
+# 1) LISTAS DE ATIVOS (Exemplo: 30 EUA, 10 BR)
+###############################################################################
+TOP_30_US = [
+    "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "TSLA", "META", "NFLX", "AVGO", "AMD",
+    "BAC", "JPM", "WFC", "GS", "C", "V", "MA", "DIS", "XOM", "CVX",
+    "KO", "PEP", "PFE", "MRK", "T", "VZ", "CSCO", "ORCL", "ADBE", "CRM"
+]
+
+TOP_10_BR = [
+    "PETR4.SA", "VALE3.SA", "ITUB4.SA", "BBDC4.SA", "ABEV3.SA",
+    "BBAS3.SA", "B3SA3.SA", "ELET3.SA", "WEGE3.SA", "JBSS3.SA"
+]
+
+ALL_SYMBOLS = TOP_30_US + TOP_10_BR  # total 40
+
+###############################################################################
+# 2) PARÂMETROS GERAIS
+###############################################################################
+PERIOD_DAILY = "1y"       # Período (diário) para GARCH
+INTERVAL_DAILY = "1d"
+
+# Timeframes intradiários
+TIMEFRAME_PARAMS = {
+    '5m':  '1mo',
+    '15m': '1mo',
+    '30m': '1mo',
+    '1h':  '1y',
+}
+
+BOLL_EMA_SPAN = 21
+BOLL_STD_MULT = 2
+RISK_REWARD_RATIO = 2.0  # COMPRA/VENDA -> StopLoss e TakeProfit c/ ratio 1:2
+
+###############################################################################
+# 3) MAPEAMENTO E FUNÇÃO PARA "ACHATAR" (FLATTEN) O DATAFRAME
+###############################################################################
+RENAME_MAP = {
+    'Open': 'Open',
+    'High': 'High',
+    'Low':  'Low',
+    'Close': 'Close',
+    'Adj Close': 'Adj Close',
+    'Volume': 'Volume',
+    'Price': 'Close'
+}
+
+def flatten_and_rename(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Se o DataFrame vier em multiindex (ex.: ('Close','PETR4.SA')),
+    drope o nível do Ticker e renomeie colunas conforme RENAME_MAP.
+    """
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.droplevel(level=1)
+    rename_dict = {}
+    for col in df.columns:
+        if col in RENAME_MAP:
+            rename_dict[col] = RENAME_MAP[col]
+    df.rename(columns=rename_dict, inplace=True)
+    return df
+
+###############################################################################
+# 4) FUNÇÃO DE ANÁLISE PARA UM ATIVO
+###############################################################################
+def analyze_symbol(symbol: str) -> pd.DataFrame:
+    """
+    Retorna DataFrame com colunas: [Symbol, Timeframe, Sinal, StopLoss, TakeProfit],
+    onde cada timeframe (5m,15m,30m,1h) será uma linha.
+    Se não conseguir analisar, retorna DF vazio.
+    """
+    results = []
+
+    # A) DADOS DIÁRIOS + GARCH
+    df_daily = yf.download(symbol, period=PERIOD_DAILY, interval=INTERVAL_DAILY)
+    if df_daily.empty:
+        return pd.DataFrame()
+
+    df_daily = flatten_and_rename(df_daily)
+    if 'Close' not in df_daily.columns:
+        return pd.DataFrame()
+
+    df_daily.dropna(how='all', inplace=True)
+    df_daily['returns'] = df_daily['Close'].pct_change()
+    df_daily.replace([np.inf, -np.inf], np.nan, inplace=True)
+    df_daily.dropna(subset=['returns'], inplace=True)
+
+    if df_daily.empty:
+        return pd.DataFrame()
+
+    # Ajuste do GARCH(1,1)
+    try:
+        model = arch_model(df_daily['returns'] * 100, vol='Garch', p=1, q=1)
+        model_fit = model.fit(disp='off')
+        forecast = model_fit.forecast(horizon=1)
+        pred_volatility = forecast.variance.iloc[-1, 0] ** 0.5  # Vol(%) 
+    except:
+        return pd.DataFrame()
+
+    last_close = df_daily['Close'].iloc[-1]
+    upper_vol = last_close * (1 + pred_volatility/100)
+    lower_vol = last_close * (1 - pred_volatility/100)
+
+    # B) DADOS INTRADIA PARA OS 4 TIMEFRAMES
+    for tf, tf_period in TIMEFRAME_PARAMS.items():
+        df_intraday = yf.download(symbol, period=tf_period, interval=tf)
+        if df_intraday.empty:
+            results.append({
+                "Symbol": symbol,
+                "Timeframe": tf,
+                "Sinal": "SemDados",
+                "StopLoss": None,
+                "TakeProfit": None
+            })
+            continue
+
+        df_intraday = flatten_and_rename(df_intraday)
+        if 'Close' not in df_intraday.columns:
+            results.append({
+                "Symbol": symbol,
+                "Timeframe": tf,
+                "Sinal": "NoClose",
+                "StopLoss": None,
+                "TakeProfit": None
+            })
+            continue
+
+        df_intraday['EMA21'] = df_intraday['Close'].ewm(span=BOLL_EMA_SPAN).mean()
+        df_intraday['stddev'] = df_intraday['Close'].rolling(BOLL_EMA_SPAN).std()
+        df_intraday.dropna(subset=['EMA21','stddev'], inplace=True)
+        if df_intraday.empty:
+            results.append({
+                "Symbol": symbol,
+                "Timeframe": tf,
+                "Sinal": "NaoHa21Candles",
+                "StopLoss": None,
+                "TakeProfit": None
+            })
+            continue
+
+        df_intraday['Bollinger_Upper'] = df_intraday['EMA21'] + (BOLL_STD_MULT * df_intraday['stddev'])
+        df_intraday['Bollinger_Lower'] = df_intraday['EMA21'] - (BOLL_STD_MULT * df_intraday['stddev'])
+
+        current_price = df_intraday['Close'].iloc[-1]
+        boll_upper = df_intraday['Bollinger_Upper'].iloc[-1]
+        boll_lower = df_intraday['Bollinger_Lower'].iloc[-1]
+
+        # Verificação de Sinal
+        if (current_price >= upper_vol) and (current_price > boll_upper):
+            stop_loss = current_price * (1 + pred_volatility/100)
+            take_profit = current_price * (1 - RISK_REWARD_RATIO*pred_volatility/100)
+            results.append({
+                "Symbol": symbol,
+                "Timeframe": tf,
+                "Sinal": "VENDA",
+                "StopLoss": round(stop_loss,4),
+                "TakeProfit": round(take_profit,4)
+            })
+        elif (current_price <= lower_vol) and (current_price < boll_lower):
+            stop_loss = current_price * (1 - pred_volatility/100)
+            take_profit = current_price * (1 + RISK_REWARD_RATIO*pred_volatility/100)
+            results.append({
+                "Symbol": symbol,
+                "Timeframe": tf,
+                "Sinal": "COMPRA",
+                "StopLoss": round(stop_loss,4),
+                "TakeProfit": round(take_profit,4)
+            })
+        else:
+            results.append({
+                "Symbol": symbol,
+                "Timeframe": tf,
+                "Sinal": "Nenhum",
+                "StopLoss": None,
+                "TakeProfit": None
+            })
+
+    return pd.DataFrame(results)
+
+###############################################################################
+# 5) FUNÇÃO P/ TRANSFORMAR AS 4 LINHAS EM 1 (FORMATO HORIZONTAL)
+###############################################################################
+def pivot_symbol_result(df_symbol: pd.DataFrame) -> dict:
+    """
+    Recebe df_symbol (com 4 linhas: timeframes 5m,15m,30m,1h)
+    e retorna um dicionário:
+      {
+        'Symbol': ...,
+        '5m': Sinal,
+        '15m': Sinal,
+        '30m': Sinal,
+        '1h': Sinal,
+        'StopLoss': ...,
+        'TakeProfit': ...
+      }
+    Se algum timeframe tiver Sinal=COMPRA/VENDA, pegamos o StopLoss/TakeProfit
+    do primeiro deles (prioridade 5m->15m->30m->1h).
+    """
+    row_dict = {
+        'Symbol': None,
+        '5m': None,
+        '15m': None,
+        '30m': None,
+        '1h': None,
+        'StopLoss': None,
+        'TakeProfit': None
+    }
+    if df_symbol.empty:
+        return row_dict
+
+    symbol = df_symbol['Symbol'].iloc[0]
+    row_dict['Symbol'] = symbol
+
+    # Map de timeframe
+    tf_map = {}
+    for _, row in df_symbol.iterrows():
+        tf_map[row['Timeframe']] = {
+            'Sinal': row['Sinal'],
+            'StopLoss': row['StopLoss'],
+            'TakeProfit': row['TakeProfit']
+        }
+
+    for tf in ['5m','15m','30m','1h']:
+        if tf in tf_map:
+            row_dict[tf] = tf_map[tf]['Sinal']
+        else:
+            row_dict[tf] = "SemDados"
+
+    # Pegar StopLoss/TakeProfit
+    for tf in ['5m','15m','30m','1h']:
+        if tf in tf_map:
+            if tf_map[tf]['Sinal'] in ("COMPRA","VENDA"):
+                row_dict['StopLoss'] = tf_map[tf]['StopLoss']
+                row_dict['TakeProfit'] = tf_map[tf]['TakeProfit']
+                break
+
+    return row_dict
+
+###############################################################################
+# 6) FLASK APP
+###############################################################################
+app = Flask(__name__)
+
+@app.route("/")
+def index():
+    """
+    Monta uma tabela:
+    [Symbol | 5m | 15m | 30m | 1h | StopLoss | TakeProfit]
+    com cor apenas na célula do timeframe que tiver COMPRA/ VENDA,
+    e recarrega auto a cada 3 minutos.
+    """
+    final_rows = []
+    for symbol in ALL_SYMBOLS:
+        df_symbol = analyze_symbol(symbol)
+        if df_symbol.empty:
+            row_dict = {
+                'Symbol': symbol,
+                '5m': 'SemDadosDia',
+                '15m': 'SemDadosDia',
+                '30m': 'SemDadosDia',
+                '1h': 'SemDadosDia',
+                'StopLoss': None,
+                'TakeProfit': None
+            }
+        else:
+            row_dict = pivot_symbol_result(df_symbol)
+        final_rows.append(row_dict)
+
+    final_df = pd.DataFrame(final_rows, columns=['Symbol','5m','15m','30m','1h','StopLoss','TakeProfit'])
+
+    # 6.1) COLORIR APENAS A CÉLULA COM SINAL
+    def highlight_signal(row):
+        """
+        Retorna lista de estilos (uma para cada coluna).
+        Se row[col] == 'COMPRA', fica verde;
+        se == 'VENDA', fica vermelho;
+        senão sem cor.
+        """
+        styles = [""] * len(row)
+        col_5m = final_df.columns.get_loc("5m")
+        col_15m = final_df.columns.get_loc("15m")
+        col_30m = final_df.columns.get_loc("30m")
+        col_1h = final_df.columns.get_loc("1h")
+
+        def color_cell(val):
+            if val == "VENDA":
+                return "background-color: #FFBABA"  # vermelho claro
+            elif val == "COMPRA":
+                return "background-color: #B6FFB6"  # verde claro
+            else:
+                return ""
+
+        styles[col_5m]  = color_cell(row["5m"])
+        styles[col_15m] = color_cell(row["15m"])
+        styles[col_30m] = color_cell(row["30m"])
+        styles[col_1h]  = color_cell(row["1h"])
+        return styles
+
+    df_style = final_df.style.apply(
+        highlight_signal, axis=1
+    )
+
+    # Ajusta estilo geral (fonte maior, largura horizontal, etc.)
+    df_style.set_properties(**{
+        'font-size': '18px',
+        'border': '1px solid black',
+        'border-collapse': 'collapse',
+        'width': '2000px'
+    })
+
+    table_html = df_style.to_html()
+
+    # Auto refresh a cada 3 min
+    auto_refresh_js = """
+    <script>
+    setTimeout(function(){
+      window.location.reload();
+    }, 180000); // 3 minutos
+    </script>
+    """
+
+    page_header = "<h1 style='font-size:24px;'>Painel de Sinais (Horizontal)</h1>"
+    page_desc = """
+    <p>
+      Exibindo colunas: <b>Symbol</b>, <b>5m</b>, <b>15m</b>, <b>30m</b>, <b>1h</b>, 
+      <b>StopLoss</b>, <b>TakeProfit</b>.<br>
+      Células dos timeframes com <span style='background-color:#B6FFB6;'>COMPRA</span>
+      ou <span style='background-color:#FFBABA;'>VENDA</span> são coloridas.<br>
+      A página recarrega automaticamente a cada 3 minutos para refazer a análise.
+    </p>
+    """
+
+    final_html = f"{auto_refresh_js}{page_header}{page_desc}{table_html}"
+    return final_html
+
+###############################################################################
+# 7) MAIN
+######################
+if __name__ == "__main__":
+    app.run(debug=True)
